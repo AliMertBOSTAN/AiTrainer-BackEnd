@@ -1,116 +1,153 @@
-#!/usr/bin/env python3
-# test_server.py - Server'ı test etmek için basit script
+import asyncio
+import websockets
+import json
+import base64
+import cv2
+import numpy as np
+from datetime import datetime
+import logging
 
-import sys
-import os
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-print("Python versiyonu:", sys.version)
-print("Çalışma dizini:", os.getcwd())
-print("-" * 50)
+class TestClient:
+    def __init__(self, server_url='ws://localhost:3000'):
+        self.server_url = server_url
+        self.running = False
+        
+    async def send_video_frames(self, video_source=0, exercise_type='pushup'):
+        """Video kaynağından frame'leri server'a gönder"""
+        cap = cv2.VideoCapture(video_source)
+        
+        if not cap.isOpened():
+            logger.error("Video kaynağı açılamadı")
+            return
+            
+        async with websockets.connect(self.server_url) as websocket:
+            logger.info("Server'a bağlandı")
+            
+            # İlk mesajı al
+            welcome = await websocket.recv()
+            logger.info(f"Server mesajı: {welcome}")
+            
+            frame_count = 0
+            self.running = True
+            
+            try:
+                while self.running:
+                    ret, frame = cap.read()
+                    if not ret:
+                        logger.info("Video sonu")
+                        break
+                    
+                    # Frame'i resize et (performans için)
+                    frame = cv2.resize(frame, (640, 480))
+                    
+                    # Frame'i base64'e çevir
+                    _, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
+                    frame_base64 = base64.b64encode(buffer).decode('utf-8')
+                    
+                    # Mesajı hazırla
+                    message = {
+                        'type': 'exercise',
+                        'image': frame_base64,
+                        'exercise_type': exercise_type,
+                        'exercise_id': f'test_{exercise_type}'
+                    }
+                    
+                    # Gönder
+                    await websocket.send(json.dumps(message))
+                    frame_count += 1
+                    
+                    # Cevabı al
+                    try:
+                        response = await asyncio.wait_for(websocket.recv(), timeout=1.0)
+                        result = json.loads(response)
+                        
+                        if result['type'] == 'result':
+                            data = result['data']
+                            logger.info(f"Frame {frame_count}: Count={data['count']}, "
+                                      f"Form={'✓' if data['correct_form'] else '✗'}, "
+                                      f"Feedback: {data['feedback']}")
+                            
+                            # İşlenmiş görüntüyü göster
+                            if 'processed_image' in data:
+                                processed_data = base64.b64decode(data['processed_image'])
+                                nparr = np.frombuffer(processed_data, np.uint8)
+                                processed_img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+                                
+                                if processed_img is not None:
+                                    # Bilgileri görüntüye ekle
+                                    cv2.putText(processed_img, f"Count: {data['count']}", 
+                                              (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, 
+                                              (0, 255, 0), 2)
+                                    cv2.putText(processed_img, data['feedback'], 
+                                              (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, 
+                                              (0, 255, 0) if data['correct_form'] else (0, 0, 255), 2)
+                                    
+                                    cv2.imshow('Processed', processed_img)
+                            
+                            # Orijinal görüntüyü de göster
+                            cv2.imshow('Original', frame)
+                            
+                    except asyncio.TimeoutError:
+                        logger.warning("Cevap zaman aşımı")
+                    
+                    # ESC tuşuna basılırsa çık
+                    if cv2.waitKey(30) == 27:
+                        break
+                    
+                    # FPS kontrolü
+                    await asyncio.sleep(0.033)  # ~30 FPS
+                    
+            finally:
+                cap.release()
+                cv2.destroyAllWindows()
+                self.running = False
+    
+    async def send_single_image(self, image_path, exercise_type='pushup'):
+        """Tek bir görüntü gönder"""
+        img = cv2.imread(image_path)
+        if img is None:
+            logger.error(f"Görüntü yüklenemedi: {image_path}")
+            return
+            
+        async with websockets.connect(self.server_url) as websocket:
+            logger.info("Server'a bağlandı")
+            
+            # Görüntüyü base64'e çevir
+            _, buffer = cv2.imencode('.jpg', img)
+            img_base64 = base64.b64encode(buffer).decode('utf-8')
+            
+            # Mesajı gönder
+            message = {
+                'type': 'exercise',
+                'image': img_base64,
+                'exercise_type': exercise_type,
+                'exercise_id': f'test_{exercise_type}_single'
+            }
+            
+            await websocket.send(json.dumps(message))
+            
+            # Cevabı al
+            response = await websocket.recv()
+            result = json.loads(response)
+            
+            if result['type'] == 'result':
+                data = result['data']
+                logger.info(f"Sonuç: {data}")
+                
+                # İşlenmiş görüntüyü göster
+                if 'processed_image' in data:
+                    processed_data = base64.b64decode(data['processed_image'])
+                    nparr = np.frombuffer(processed_data, np.uint8)
+                    processed_img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+                    
+                    if processed_img is not None:
+                        cv2.imshow('Processed', processed_img)
+                        cv2.waitKey(0)
+                        cv2.destroyAllWindows()
 
-# 1. Import testleri
-print("1. Kütüphaneler kontrol ediliyor...")
-try:
-    import socket
-    print("   ✓ socket")
-except ImportError:
-    print("   ✗ socket BULUNAMADI!")
-
-try:
-    import threading
-    print("   ✓ threading")
-except ImportError:
-    print("   ✗ threading BULUNAMADI!")
-
-try:
-    import json
-    print("   ✓ json")
-except ImportError:
-    print("   ✗ json BULUNAMADI!")
-
-try:
-    import base64
-    print("   ✓ base64")
-except ImportError:
-    print("   ✗ base64 BULUNAMADI!")
-
-try:
-    import cv2
-    print("   ✓ cv2 (OpenCV)")
-    print(f"     OpenCV versiyon: {cv2.__version__}")
-except ImportError as e:
-    print(f"   ✗ cv2 (OpenCV) BULUNAMADI! Hata: {e}")
-    print("     Yüklemek için: pip install opencv-python")
-
-try:
-    import numpy as np
-    print("   ✓ numpy")
-    print(f"     NumPy versiyon: {np.__version__}")
-except ImportError as e:
-    print(f"   ✗ numpy BULUNAMADI! Hata: {e}")
-    print("     Yüklemek için: pip install numpy")
-
-try:
-    import mediapipe as mp
-    print("   ✓ mediapipe")
-    print(f"     MediaPipe versiyon: {mp.__version__}")
-except ImportError as e:
-    print(f"   ✗ mediapipe BULUNAMADI! Hata: {e}")
-    print("     Yüklemek için: pip install mediapipe")
-
-print("-" * 50)
-
-# 2. Port kontrolü
-print("2. Port durumu kontrol ediliyor...")
-import socket
-
-def check_port(host, port):
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.settimeout(1)
-    result = sock.connect_ex((host, port))
-    sock.close()
-    return result == 0
-
-if check_port('localhost', 5000):
-    print("   ⚠️  Port 5000 zaten kullanımda!")
-    print("   Başka bir port deneyin veya mevcut işlemi durdurun.")
-else:
-    print("   ✓ Port 5000 kullanılabilir")
-
-print("-" * 50)
-
-# 3. Basit socket testi
-print("3. Socket bağlantı testi...")
-try:
-    test_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    test_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    test_socket.bind(('0.0.0.0', 5555))
-    test_socket.close()
-    print("   ✓ Socket oluşturma başarılı")
-except Exception as e:
-    print(f"   ✗ Socket hatası: {e}")
-
-print("-" * 50)
-
-# 4. MediaPipe testi
-print("4. MediaPipe Pose testi...")
-try:
-    import mediapipe as mp
-    mp_pose = mp.solutions.pose
-    pose = mp_pose.Pose(
-        static_image_mode=False,
-        model_complexity=1,
-        min_detection_confidence=0.5,
-        min_tracking_confidence=0.5
-    )
-    print("   ✓ MediaPipe Pose başarıyla oluşturuldu")
-    pose.close()
-except Exception as e:
-    print(f"   ✗ MediaPipe hatası: {e}")
-    import traceback
-    traceback.print_exc()
-
-print("-" * 50)
-print("\nTüm testler tamamlandı!")
-print("\nEğer tüm testler başarılıysa, server'ı çalıştırmayı deneyin:")
-print("python mediapipe_server.py")
+    async def test_http_endpoint(self, image_path, exercise_type='pushup'):
+        """HTTP endpoint'i test et"""
+        import a
