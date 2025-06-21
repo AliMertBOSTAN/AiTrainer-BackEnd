@@ -1,4 +1,4 @@
-# fitness_server.py - Dinamik IP ve Port versiyonu
+# fitness_server.py - Düzeltilmiş ve optimize edilmiş versiyon
 import asyncio
 import websockets
 import json
@@ -98,6 +98,8 @@ class PoseDetector:
             min_detection_confidence=0.7,
             min_tracking_confidence=0.5
         )
+        self.results = None
+        self.lm_list = []
         
     def find_pose(self, img, draw=True):
         img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
@@ -114,7 +116,7 @@ class PoseDetector:
     
     def find_position(self, img):
         self.lm_list = []
-        if self.results.pose_landmarks:
+        if self.results and self.results.pose_landmarks:
             for id, lm in enumerate(self.results.pose_landmarks.landmark):
                 h, w, c = img.shape
                 cx, cy = int(lm.x * w), int(lm.y * h)
@@ -147,117 +149,153 @@ class PoseDetector:
 class ExerciseAnalyzer:
     def __init__(self):
         self.detector = PoseDetector()
+        self.exercises = {
+            'pushup': self.analyze_pushup,
+            'push_up': self.analyze_pushup,
+            'squat': self.analyze_squat,
+            'biceps_curl': self.analyze_biceps_curl,
+            'bicep_curl': self.analyze_biceps_curl,
+            'shoulder_press': self.analyze_shoulder_press,
+            'plank': self.analyze_plank,
+            'lunges': self.analyze_lunge,
+            'lunge': self.analyze_lunge,
+            'jumping_jack': self.analyze_jumping_jack,
+            'jumping_jacks': self.analyze_jumping_jack,
+            'situp': self.analyze_situp,
+            'sit_up': self.analyze_situp,
+            'sit-up': self.analyze_situp
+        }
         self.exercise_state = {}
         
     def analyze(self, img, exercise_type, exercise_id):
-        # Resmi işle
+        # Resmi kopyala
         output_img = img.copy()
+        
+        # Pose tespiti
         output_img = self.detector.find_pose(output_img)
         lm_list = self.detector.find_position(output_img)
         
-        # Egzersiz durumunu başlat
-        if exercise_id not in self.exercise_state:
-            self.exercise_state[exercise_id] = {
-                'count': 0,
-                'direction': 0,
-                'form_score': 100
-            }
+        # Egzersiz tipini normalize et
+        exercise_type = exercise_type.lower().replace('-', '_').replace(' ', '_')
         
         # Egzersiz tipine göre analiz
-        if lm_list:
-            if exercise_type == 'squat':
-                return self.analyze_squat(output_img, lm_list, exercise_id)
-            elif exercise_type == 'pushup':
-                return self.analyze_pushup(output_img, lm_list, exercise_id)
-            elif exercise_type == 'biceps_curl':
-                return self.analyze_biceps_curl(output_img, lm_list, exercise_id)
-            else:
-                # Diğer egzersizler için basit sayma
-                return self.simple_count(output_img, lm_list, exercise_id)
+        if exercise_type in self.exercises and lm_list:
+            if exercise_id not in self.exercise_state:
+                self.exercise_state[exercise_id] = {
+                    'count': 0,
+                    'direction': 0,
+                    'form_errors': []
+                }
+            
+            result = self.exercises[exercise_type](output_img, lm_list, exercise_id)
+            return output_img, result
         
         return output_img, {
             'count': 0,
             'correct_form': False,
-            'feedback': 'Vücut tespit edilemedi. Kameranın önünde durun.'
-        }
-    
-    def analyze_squat(self, img, lm_list, exercise_id):
-        state = self.exercise_state[exercise_id]
-        
-        # Açıları hesapla
-        left_knee = self.detector.find_angle(img, 23, 25, 27)  # Sol diz
-        right_knee = self.detector.find_angle(img, 24, 26, 28)  # Sağ diz
-        
-        # Form kontrolü
-        correct_form = True
-        feedback = []
-        
-        # Squat sayımı
-        avg_knee = (left_knee + right_knee) / 2
-        
-        if avg_knee > 170:
-            if state['direction'] == 0:
-                state['count'] += 0.5
-                state['direction'] = 1
-        elif avg_knee < 90:
-            if state['direction'] == 1:
-                state['count'] += 0.5
-                state['direction'] = 0
-                
-        # UI'da gösterilecek bilgiler
-        cv2.putText(img, f"Tekrar: {int(state['count'])}", (50, 50), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-        
-        if not feedback:
-            feedback.append("Harika form!")
-            
-        return img, {
-            'count': int(state['count']),
-            'correct_form': correct_form,
-            'feedback': ' - '.join(feedback) if feedback else "Harika form!"
+            'feedback': f'Egzersiz tipi tanınamadı ({exercise_type}) veya vücut tespit edilemedi'
         }
     
     def analyze_pushup(self, img, lm_list, exercise_id):
         state = self.exercise_state[exercise_id]
+        feedback = []
+        correct_form = True
         
-        # Kol açıları
-        left_arm = self.detector.find_angle(img, 11, 13, 15)
-        right_arm = self.detector.find_angle(img, 12, 14, 16)
+        # Sol kol açısı (11-13-15: omuz-dirsek-bilek)
+        left_arm_angle = self.detector.find_angle(img, 11, 13, 15)
+        # Sağ kol açısı (12-14-16)
+        right_arm_angle = self.detector.find_angle(img, 12, 14, 16)
+        
+        # Vücut düzlüğü kontrolü (11-23-25: omuz-kalça-diz)
+        body_angle = self.detector.find_angle(img, 11, 23, 25)
         
         # Form kontrolü
-        correct_form = True
-        feedback = []
+        if abs(body_angle - 180) > 30:
+            feedback.append("Vücudunuzu düz tutun")
+            correct_form = False
+            
+        # Push-up sayımı (kol açısına göre)
+        avg_arm_angle = (left_arm_angle + right_arm_angle) / 2
         
-        # Push-up sayımı
-        avg_arm = (left_arm + right_arm) / 2
-        
-        if avg_arm > 160:
+        if avg_arm_angle > 160:
             if state['direction'] == 0:
                 state['count'] += 0.5
                 state['direction'] = 1
-        elif avg_arm < 90:
+        elif avg_arm_angle < 90:
             if state['direction'] == 1:
                 state['count'] += 0.5
                 state['direction'] = 0
                 
-        cv2.putText(img, f"Tekrar: {int(state['count'])}", (50, 50), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-        
-        return img, {
+        # Feedback oluştur
+        if not feedback:
+            feedback.append("Harika gidiyorsunuz!")
+            
+        return {
             'count': int(state['count']),
             'correct_form': correct_form,
-            'feedback': "Mükemmel!"
+            'feedback': ' - '.join(feedback)
+        }
+    
+    def analyze_squat(self, img, lm_list, exercise_id):
+        state = self.exercise_state[exercise_id]
+        feedback = []
+        correct_form = True
+        
+        # Bacak açıları
+        left_knee_angle = self.detector.find_angle(img, 23, 25, 27)
+        right_knee_angle = self.detector.find_angle(img, 24, 26, 28)
+        
+        # Sırt düzlüğü
+        back_angle = self.detector.find_angle(img, 11, 23, 25)
+        
+        # Form kontrolü
+        if back_angle < 140:
+            feedback.append("Sırtınızı dik tutun")
+            correct_form = False
+            
+        # Squat sayımı
+        avg_knee_angle = (left_knee_angle + right_knee_angle) / 2
+        
+        if avg_knee_angle > 170:
+            if state['direction'] == 0:
+                state['count'] += 0.5
+                state['direction'] = 1
+        elif avg_knee_angle < 90:
+            if state['direction'] == 1:
+                state['count'] += 0.5
+                state['direction'] = 0
+                
+        if not feedback:
+            feedback.append("Mükemmel form!")
+            
+        return {
+            'count': int(state['count']),
+            'correct_form': correct_form,
+            'feedback': ' - '.join(feedback)
         }
     
     def analyze_biceps_curl(self, img, lm_list, exercise_id):
         state = self.exercise_state[exercise_id]
+        feedback = []
+        correct_form = True
         
         # Kol açıları
-        left_arm = self.detector.find_angle(img, 11, 13, 15)
-        right_arm = self.detector.find_angle(img, 12, 14, 16)
+        left_arm_angle = self.detector.find_angle(img, 11, 13, 15)
+        right_arm_angle = self.detector.find_angle(img, 12, 14, 16)
         
+        # Dirsek pozisyonu kontrolü
+        left_elbow_angle = self.detector.find_angle(img, 13, 11, 23)
+        right_elbow_angle = self.detector.find_angle(img, 14, 12, 24)
+        
+        if left_elbow_angle > 30:
+            feedback.append("Sol dirseğinizi vücudunuza yakın tutun")
+            correct_form = False
+        if right_elbow_angle < 330:
+            feedback.append("Sağ dirseğinizi vücudunuza yakın tutun")
+            correct_form = False
+            
         # Biceps curl sayımı
-        avg_angle = (left_arm + right_arm) / 2
+        avg_angle = (left_arm_angle + right_arm_angle) / 2
         
         if avg_angle > 160:
             if state['direction'] == 0:
@@ -268,28 +306,245 @@ class ExerciseAnalyzer:
                 state['count'] += 0.5
                 state['direction'] = 0
                 
-        cv2.putText(img, f"Tekrar: {int(state['count'])}", (50, 50), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-        
-        return img, {
+        if not feedback:
+            feedback.append("Doğru form!")
+            
+        return {
             'count': int(state['count']),
-            'correct_form': True,
-            'feedback': "Harika gidiyorsunuz!"
+            'correct_form': correct_form,
+            'feedback': ' - '.join(feedback)
         }
     
-    def simple_count(self, img, lm_list, exercise_id):
+    def analyze_shoulder_press(self, img, lm_list, exercise_id):
         state = self.exercise_state[exercise_id]
+        feedback = []
+        correct_form = True
         
-        # Basit hareket sayımı
-        state['count'] += 0.1  # Her frame'de küçük artış
+        # Omuz açıları
+        left_shoulder_angle = self.detector.find_angle(img, 23, 11, 13)
+        right_shoulder_angle = self.detector.find_angle(img, 24, 12, 14)
         
-        cv2.putText(img, f"Hareket Algılandi: {int(state['count'])}", (50, 50), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+        # Dirsek açıları
+        left_elbow_angle = self.detector.find_angle(img, 11, 13, 15)
+        right_elbow_angle = self.detector.find_angle(img, 12, 14, 16)
         
-        return img, {
+        # Form kontrolü
+        if left_elbow_angle < 70 or left_elbow_angle > 110:
+            feedback.append("Sol dirseğinizi 90 derece açıda tutun")
+            correct_form = False
+            
+        # Shoulder press sayımı
+        avg_shoulder_angle = (left_shoulder_angle + right_shoulder_angle) / 2
+        
+        if avg_shoulder_angle > 160:
+            if state['direction'] == 0:
+                state['count'] += 0.5
+                state['direction'] = 1
+        elif avg_shoulder_angle < 90:
+            if state['direction'] == 1:
+                state['count'] += 0.5
+                state['direction'] = 0
+                
+        if not feedback:
+            feedback.append("Harika form!")
+            
+        return {
             'count': int(state['count']),
-            'correct_form': True,
-            'feedback': "Devam edin!"
+            'correct_form': correct_form,
+            'feedback': ' - '.join(feedback)
+        }
+    
+    def analyze_plank(self, img, lm_list, exercise_id):
+        state = self.exercise_state[exercise_id]
+        feedback = []
+        correct_form = True
+        
+        # Vücut düzlüğü kontrolü
+        body_angle = self.detector.find_angle(img, 11, 23, 27)
+        
+        # Kalça yüksekliği kontrolü
+        hip_angle = self.detector.find_angle(img, 11, 23, 25)
+        
+        # Baş pozisyonu kontrolü
+        if len(lm_list) > 7:
+            neck_angle = self.detector.find_angle(img, 7, 11, 23)
+        else:
+            neck_angle = 160  # Varsayılan değer
+        
+        # Form kontrolleri
+        if abs(body_angle - 180) > 25:
+            feedback.append("Vücudunuzu düz bir çizgi halinde tutun")
+            correct_form = False
+            
+        if hip_angle < 150:
+            feedback.append("Kalçanız çok aşağıda")
+            correct_form = False
+        elif hip_angle > 210:
+            feedback.append("Kalçanız çok yukarıda")
+            correct_form = False
+            
+        if neck_angle < 140:
+            feedback.append("Başınızı nötr pozisyonda tutun")
+            correct_form = False
+            
+        # Plank süresi sayacı (saniye)
+        state['count'] += 1/30  # 30 FPS varsayımı
+        
+        if not feedback:
+            feedback.append(f"Mükemmel form! {int(state['count'])} saniye")
+            
+        return {
+            'count': int(state['count']),
+            'correct_form': correct_form,
+            'feedback': ' - '.join(feedback)
+        }
+    
+    def analyze_situp(self, img, lm_list, exercise_id):
+        state = self.exercise_state[exercise_id]
+        feedback = []
+        correct_form = True
+        
+        # Gövde açısı
+        torso_angle = self.detector.find_angle(img, 11, 23, 25)
+        
+        # Bacak açısı
+        leg_angle = self.detector.find_angle(img, 23, 25, 27)
+        
+        # Boyun pozisyonu
+        if len(lm_list) > 7:
+            neck_angle = self.detector.find_angle(img, 7, 11, 23)
+        else:
+            neck_angle = 150  # Varsayılan değer
+        
+        # Form kontrolleri
+        if leg_angle < 80 or leg_angle > 120:
+            feedback.append("Dizlerinizi 90 derece açıda tutun")
+            correct_form = False
+            
+        if neck_angle < 120:
+            feedback.append("Boynunuzu zorlamayın, nötr tutun")
+            correct_form = False
+            
+        # Sit-up sayımı
+        if torso_angle < 100:  # Yukarı pozisyon
+            if state['direction'] == 0:
+                state['count'] += 0.5
+                state['direction'] = 1
+        elif torso_angle > 150:  # Aşağı pozisyon
+            if state['direction'] == 1:
+                state['count'] += 0.5
+                state['direction'] = 0
+                
+        if not feedback:
+            feedback.append("Harika form!")
+            
+        return {
+            'count': int(state['count']),
+            'correct_form': correct_form,
+            'feedback': ' - '.join(feedback)
+        }
+    
+    def analyze_jumping_jack(self, img, lm_list, exercise_id):
+        state = self.exercise_state[exercise_id]
+        feedback = []
+        correct_form = True
+        
+        # Kol açıları
+        left_arm_angle = self.detector.find_angle(img, 23, 11, 13)
+        right_arm_angle = self.detector.find_angle(img, 24, 12, 14)
+        
+        # Bacak genişliği kontrolü
+        hip_width = abs(lm_list[23][1] - lm_list[24][1])
+        ankle_width = abs(lm_list[27][1] - lm_list[28][1])
+        
+        # Vücut dikliği
+        body_straightness = self.detector.find_angle(img, 11, 23, 27)
+        
+        # Form kontrolleri
+        if abs(body_straightness - 180) > 20:
+            feedback.append("Vücudunuzu dik tutun")
+            correct_form = False
+            
+        # Jumping jack sayımı
+        avg_arm_angle = (left_arm_angle + right_arm_angle) / 2
+        
+        # Açık pozisyon: Kollar yukarıda, bacaklar açık
+        if avg_arm_angle > 160 and ankle_width > hip_width * 2:
+            if state['direction'] == 0:
+                state['count'] += 0.5
+                state['direction'] = 1
+        # Kapalı pozisyon: Kollar aşağıda, bacaklar kapalı
+        elif avg_arm_angle < 30 and ankle_width < hip_width * 1.2:
+            if state['direction'] == 1:
+                state['count'] += 0.5
+                state['direction'] = 0
+                
+        if not feedback:
+            feedback.append("Mükemmel ritim!")
+            
+        return {
+            'count': int(state['count']),
+            'correct_form': correct_form,
+            'feedback': ' - '.join(feedback)
+        }
+    
+    def analyze_lunge(self, img, lm_list, exercise_id):
+        state = self.exercise_state[exercise_id]
+        feedback = []
+        correct_form = True
+        
+        # Sol ve sağ bacak pozisyonlarını belirle
+        left_hip_y = lm_list[23][2]
+        right_hip_y = lm_list[24][2]
+        left_knee_y = lm_list[25][2]
+        right_knee_y = lm_list[26][2]
+        
+        # Hangi bacağın önde olduğunu belirle
+        if left_knee_y > right_knee_y:  # Sol bacak önde
+            front_knee_angle = self.detector.find_angle(img, 23, 25, 27)
+            back_knee_angle = self.detector.find_angle(img, 24, 26, 28)
+            hip_angle = self.detector.find_angle(img, 11, 23, 25)
+        else:  # Sağ bacak önde
+            front_knee_angle = self.detector.find_angle(img, 24, 26, 28)
+            back_knee_angle = self.detector.find_angle(img, 23, 25, 27)
+            hip_angle = self.detector.find_angle(img, 12, 24, 26)
+        
+        # Gövde dikliği
+        torso_angle = self.detector.find_angle(img, 11, 23, 24)
+        
+        # Form kontrolleri
+        if front_knee_angle < 70:
+            feedback.append("Ön diziniz çok öne gitti")
+            correct_form = False
+        elif front_knee_angle > 110 and state['direction'] == 1:
+            feedback.append("Ön dizinizi daha fazla bükün")
+            correct_form = False
+            
+        if back_knee_angle < 80 and state['direction'] == 1:
+            feedback.append("Arka diziniz yere çok yakın")
+            correct_form = False
+            
+        if abs(torso_angle - 180) > 25:
+            feedback.append("Gövdenizi dik tutun")
+            correct_form = False
+            
+        # Lunge sayımı
+        if front_knee_angle < 100:  # Aşağı pozisyon
+            if state['direction'] == 0:
+                state['count'] += 0.5
+                state['direction'] = 1
+        elif front_knee_angle > 160:  # Yukarı pozisyon
+            if state['direction'] == 1:
+                state['count'] += 0.5
+                state['direction'] = 0
+                
+        if not feedback:
+            feedback.append("Mükemmel lunge!")
+            
+        return {
+            'count': int(state['count']),
+            'correct_form': correct_form,
+            'feedback': ' - '.join(feedback)
         }
 
 class WebSocketServer:
@@ -309,6 +564,7 @@ class WebSocketServer:
                 'type': 'connected',
                 'message': 'Fitness AI Server\'a hoş geldiniz!',
                 'server_info': self.server_info,
+                'supported_exercises': list(self.analyzer.exercises.keys()),
                 'timestamp': datetime.now().timestamp()
             }
             await websocket.send(json.dumps(welcome))
@@ -358,6 +614,10 @@ class WebSocketServer:
                         
                 except json.JSONDecodeError:
                     logger.error("Geçersiz JSON mesajı")
+                    await websocket.send(json.dumps({
+                        'type': 'error',
+                        'message': 'Geçersiz JSON formatı'
+                    }))
                 except Exception as e:
                     logger.error(f"Mesaj işleme hatası: {str(e)}")
                     error_response = {
@@ -405,6 +665,9 @@ class WebSocketServer:
         
         print("\nReact Native uygulamanızda şu URL'yi kullanın:")
         print(f"  const wsUrl = 'ws://{host}:{port}';")
+        print("\nDesteklenen egzersizler:")
+        for ex in sorted(set(self.analyzer.exercises.values()), key=lambda x: x.__name__):
+            print(f"  - {ex.__name__.replace('analyze_', '')}")
         print("="*50 + "\n")
         
         server = await websockets.serve(self.handle_client, '0.0.0.0', port)
@@ -413,7 +676,11 @@ class WebSocketServer:
 
 # HTTP Alternatif
 from aiohttp import web
-import aiohttp_cors
+try:
+    import aiohttp_cors
+except ImportError:
+    logger.warning("aiohttp_cors yüklü değil. HTTP CORS desteği olmayacak.")
+    aiohttp_cors = None
 
 class HTTPServer:
     def __init__(self):
@@ -469,7 +736,9 @@ class HTTPServer:
     
     async def info_handler(self, request):
         """Server bilgilerini döndür"""
-        return web.json_response(self.server_info)
+        info = dict(self.server_info)
+        info['supported_exercises'] = list(self.analyzer.exercises.keys())
+        return web.json_response(info)
     
     async def start_http(self, host=None, port=None):
         # Otomatik IP ve port bul
@@ -492,19 +761,39 @@ class HTTPServer:
         app = web.Application()
         
         # CORS ayarları
-        cors = aiohttp_cors.setup(app, defaults={
-            "*": aiohttp_cors.ResourceOptions(
-                allow_credentials=True,
-                expose_headers="*",
-                allow_headers="*",
-                allow_methods="*"
-            )
-        })
-        
-        # Route'ları ekle
-        app.router.add_get('/info', self.info_handler)
-        resource = cors.add(app.router.add_resource("/process"))
-        cors.add(resource.add_route("POST", self.process_request))
+        if aiohttp_cors:
+            cors = aiohttp_cors.setup(app, defaults={
+                "*": aiohttp_cors.ResourceOptions(
+                    allow_credentials=True,
+                    expose_headers="*",
+                    allow_headers="*",
+                    allow_methods="*"
+                )
+            })
+            
+            # Route'ları ekle
+            app.router.add_get('/info', self.info_handler)
+            resource = cors.add(app.router.add_resource("/process"))
+            cors.add(resource.add_route("POST", self.process_request))
+        else:
+            # CORS olmadan route'ları ekle
+            app.router.add_get('/info', self.info_handler)
+            app.router.add_post('/process', self.process_request)
+            
+            # Manuel CORS middleware
+            async def cors_middleware(app, handler):
+                async def middleware_handler(request):
+                    if request.method == 'OPTIONS':
+                        response = web.Response()
+                    else:
+                        response = await handler(request)
+                    response.headers['Access-Control-Allow-Origin'] = '*'
+                    response.headers['Access-Control-Allow-Methods'] = 'POST, GET, OPTIONS'
+                    response.headers['Access-Control-Allow-Headers'] = 'Content-Type'
+                    return response
+                return middleware_handler
+            
+            app.middlewares.append(cors_middleware)
         
         print("\n" + "="*50)
         print("FITNESS AI HTTP SERVER")
