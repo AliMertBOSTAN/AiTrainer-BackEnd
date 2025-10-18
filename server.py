@@ -584,6 +584,10 @@ class WebSocketServer:
                         
                         # Görüntüyü yeniden boyutlandır
                         img = cv2.resize(img, (640, 480))
+
+                        # WS üzerinden gelen ham görüntüyü ekranda göster
+                        cv2.imshow("WS Frame", img)
+                        cv2.waitKey(1)
                         
                         # Egzersiz analizi
                         exercise_type = data.get('exercise_type', 'unknown')
