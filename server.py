@@ -1,21 +1,305 @@
 # fitness_server.py - Düzeltilmiş ve optimize edilmiş versiyon
 import asyncio
-import websockets
-import json
 import base64
-import cv2
-import numpy as np
-import mediapipe as mp
-import math
-from datetime import datetime
+import json
 import logging
+import math
+import os
+import platform
+import random
+import smtplib
 import socket
 import sys
-import platform
+from datetime import datetime, timedelta
+from email.mime.text import MIMEText
+
+import bcrypt
+import cv2
+import jwt
+import mediapipe as mp
+import numpy as np
+import websockets
+from dotenv import load_dotenv
+from fastapi import FastAPI, HTTPException
+from motor.motor_asyncio import AsyncIOMotorClient
+from pydantic import BaseModel
 
 # Logging yapılandırması
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+load_dotenv()
+
+MONGODB_URI = os.environ.get("MONGODB_URI")
+mongo_client = None
+users_collection = None
+
+if MONGODB_URI:
+    try:
+        mongo_client = AsyncIOMotorClient(MONGODB_URI)
+        db = mongo_client["aitrainer"]
+        users_collection = db["users"]
+        logger.info("MongoDB Atlas bağlantısı kuruldu.")
+    except Exception as exc:
+        logger.error(f"MongoDB Atlas bağlantısı kurulamadı: {exc}")
+        users_collection = None
+else:
+    logger.warning("MONGODB_URI tanımlı değil. Auth API veritabanına bağlanamayacak.")
+
+JWT_SECRET = os.environ.get("JWT_SECRET")
+if not JWT_SECRET:
+    logger.warning("JWT_SECRET tanımlı değil. JWT üretimi başarısız olacaktır.")
+
+MAILER_EMAIL = os.environ.get("MAILER_EMAIL")
+MAILER_APP_PASSWORD = os.environ.get("MAILER_APP_PASSWORD")
+if not MAILER_EMAIL or not MAILER_APP_PASSWORD:
+    logger.warning("MAILER_EMAIL veya MAILER_APP_PASSWORD tanımlı değil. Doğrulama e-postaları gönderilemeyecek.")
+
+VERIFICATION_CODE_TTL_MINUTES = 15
+VERIFICATION_CODE_COOLDOWN_SECONDS = 60
+
+auth_app = FastAPI(title="AiTrainer Auth API")
+
+
+class RegisterBody(BaseModel):
+    name: str
+    email: str
+    password: str
+
+
+class VerifyEmailBody(BaseModel):
+    email: str
+    code: str
+
+
+class ResendCodeBody(BaseModel):
+    email: str
+
+
+class LoginBody(BaseModel):
+    email: str
+    password: str
+
+
+def normalize_email(value: str) -> str:
+    return value.strip().lower()
+
+
+def create_token(user_id: str) -> str:
+    if not JWT_SECRET:
+        raise RuntimeError("JWT_SECRET tanımlı değil.")
+    payload = {
+        "sub": user_id,
+        "exp": datetime.utcnow() + timedelta(days=7),
+    }
+    return jwt.encode(payload, JWT_SECRET, algorithm="HS256")
+
+
+def send_verification_email(to_email: str, code: str, name: str) -> None:
+    if not MAILER_EMAIL or not MAILER_APP_PASSWORD:
+        raise RuntimeError("Mailer kimlik bilgileri tanımlı değil.")
+
+    display_name = name.strip() or "AiTrainer Kullanıcısı"
+    body = f"""Merhaba {display_name},
+
+AiTrainer hesabınızı doğrulamak için kodunuz: {code}
+
+Kod 15 dakika geçerli."""
+    msg = MIMEText(body)
+    msg["Subject"] = "AiTrainer Hesap Doğrulama Kodunuz"
+    msg["From"] = MAILER_EMAIL
+    msg["To"] = to_email
+
+    with smtplib.SMTP("smtp.gmail.com", 587) as smtp:
+        smtp.starttls()
+        smtp.login(MAILER_EMAIL, MAILER_APP_PASSWORD)
+        smtp.send_message(msg)
+
+
+def get_users_collection():
+    if users_collection is None:
+        logger.error("MongoDB bağlantısı yapılandırılmadı.")
+        raise HTTPException(status_code=500, detail="Veritabanı yapılandırılmadı.")
+    return users_collection
+
+
+async def dispatch_verification_email(to_email: str, code: str, name: str) -> None:
+    try:
+        await asyncio.to_thread(send_verification_email, to_email, code, name)
+    except Exception as exc:
+        logger.error(f"Doğrulama e-postası gönderilemedi: {exc}")
+        raise HTTPException(status_code=500, detail="Doğrulama e-postası gönderilemedi.")
+
+
+@auth_app.post("/api/auth/register")
+async def register(body: RegisterBody):
+    users = get_users_collection()
+    email = normalize_email(body.email)
+    name = body.name.strip()
+    password = body.password
+
+    if not email:
+        raise HTTPException(status_code=400, detail="E-posta adresi gerekli.")
+    if not name:
+        raise HTTPException(status_code=400, detail="İsim gerekli.")
+    if not password:
+        raise HTTPException(status_code=400, detail="Şifre gerekli.")
+
+    existing = await users.find_one({"email": email})
+
+    if existing and existing.get("isVerified"):
+        raise HTTPException(status_code=409, detail="Bu e-posta zaten kayıtlı.")
+
+    code = f"{random.randint(0, 999999):06d}"
+    hashed_code = bcrypt.hashpw(code.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+    password_hash = bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+    now = datetime.utcnow()
+    expires = now + timedelta(minutes=VERIFICATION_CODE_TTL_MINUTES)
+
+    user_doc = {
+        "name": name,
+        "email": email,
+        "passwordHash": password_hash,
+        "isVerified": False,
+        "verificationCodeHash": hashed_code,
+        "verificationCodeExpiresAt": expires,
+        "lastVerificationEmailSentAt": now,
+        "updatedAt": now,
+    }
+
+    if existing:
+        await users.update_one({"_id": existing["_id"]}, {"$set": user_doc})
+    else:
+        user_doc["createdAt"] = now
+        await users.insert_one(user_doc)
+
+    await dispatch_verification_email(email, code, name)
+    return {"message": "Doğrulama kodu e-posta adresinize gönderildi."}
+
+
+@auth_app.post("/api/auth/verify-email")
+async def verify_email(body: VerifyEmailBody):
+    users = get_users_collection()
+    email = normalize_email(body.email)
+    code = body.code.strip()
+
+    if not email or not code:
+        raise HTTPException(status_code=400, detail="E-posta ve doğrulama kodu gerekli.")
+
+    existing = await users.find_one({"email": email})
+
+    if not existing:
+        raise HTTPException(status_code=404, detail="Kullanıcı bulunamadı.")
+    if existing.get("isVerified"):
+        return {"message": "E-posta zaten doğrulanmış."}
+
+    stored_hash = existing.get("verificationCodeHash")
+    expires_at = existing.get("verificationCodeExpiresAt")
+    now = datetime.utcnow()
+
+    if not stored_hash or not expires_at:
+        raise HTTPException(status_code=400, detail="Doğrulama kodu bulunamadı.")
+    if expires_at < now:
+        raise HTTPException(status_code=400, detail="Doğrulama kodunun süresi dolmuş.")
+
+    if not bcrypt.checkpw(code.encode("utf-8"), stored_hash.encode("utf-8")):
+        raise HTTPException(status_code=400, detail="Doğrulama kodu geçersiz.")
+
+    await users.update_one(
+        {"_id": existing["_id"]},
+        {
+            "$set": {
+                "isVerified": True,
+                "verificationCodeHash": None,
+                "verificationCodeExpiresAt": None,
+                "updatedAt": now,
+                "verifiedAt": now,
+            }
+        },
+    )
+
+    return {"message": "E-posta başarıyla doğrulandı."}
+
+
+@auth_app.post("/api/auth/resend-code")
+async def resend_code(body: ResendCodeBody):
+    users = get_users_collection()
+    email = normalize_email(body.email)
+
+    if not email:
+        raise HTTPException(status_code=400, detail="E-posta adresi gerekli.")
+
+    existing = await users.find_one({"email": email})
+
+    if not existing:
+        raise HTTPException(status_code=404, detail="Kullanıcı bulunamadı.")
+    if existing.get("isVerified"):
+        raise HTTPException(status_code=400, detail="E-posta zaten doğrulanmış.")
+
+    now = datetime.utcnow()
+    last_sent = existing.get("lastVerificationEmailSentAt")
+
+    if isinstance(last_sent, datetime):
+        elapsed = (now - last_sent).total_seconds()
+        if elapsed < VERIFICATION_CODE_COOLDOWN_SECONDS:
+            remaining = int(VERIFICATION_CODE_COOLDOWN_SECONDS - elapsed)
+            raise HTTPException(status_code=429, detail=f"Lütfen {remaining} saniye sonra tekrar deneyin.")
+
+    code = f"{random.randint(0, 999999):06d}"
+    hashed_code = bcrypt.hashpw(code.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+    expires = now + timedelta(minutes=VERIFICATION_CODE_TTL_MINUTES)
+
+    await users.update_one(
+        {"_id": existing["_id"]},
+        {
+            "$set": {
+                "verificationCodeHash": hashed_code,
+                "verificationCodeExpiresAt": expires,
+                "lastVerificationEmailSentAt": now,
+                "updatedAt": now,
+            }
+        },
+    )
+
+    await dispatch_verification_email(email, code, existing.get("name", ""))
+    return {"message": "Yeni doğrulama kodu gönderildi."}
+
+
+@auth_app.post("/api/auth/login")
+async def login(body: LoginBody):
+    users = get_users_collection()
+    email = normalize_email(body.email)
+    password = body.password
+
+    if not email or not password:
+        raise HTTPException(status_code=400, detail="E-posta ve şifre gerekli.")
+
+    existing = await users.find_one({"email": email})
+
+    if not existing or not existing.get("passwordHash"):
+        raise HTTPException(status_code=401, detail="E-posta veya şifre yanlış.")
+    if not existing.get("isVerified"):
+        raise HTTPException(status_code=403, detail="Hesabınız henüz doğrulanmamış.")
+
+    stored_password_hash = existing["passwordHash"]
+    if not bcrypt.checkpw(password.encode("utf-8"), stored_password_hash.encode("utf-8")):
+        raise HTTPException(status_code=401, detail="E-posta veya şifre yanlış.")
+
+    try:
+        token = create_token(str(existing["_id"]))
+    except Exception as exc:
+        logger.error(f"JWT üretimi sırasında hata: {exc}")
+        raise HTTPException(status_code=500, detail="Oturum açılamadı.")
+
+    return {
+        "token": token,
+        "user": {
+            "id": str(existing["_id"]),
+            "name": existing.get("name"),
+            "email": existing.get("email"),
+        },
+    }
+
 
 def get_local_ip():
     """Yerel IP adresini otomatik bul"""
@@ -586,8 +870,8 @@ class WebSocketServer:
                         img = cv2.resize(img, (640, 480))
 
                         # WS üzerinden gelen ham görüntüyü ekranda göster
-                        cv2.imshow("WS Frame", img)
-                        cv2.waitKey(1)
+                        # cv2.imshow("WS Frame", img)
+                        # cv2.waitKey(1)
                         
                         # Egzersiz analizi
                         exercise_type = data.get('exercise_type', 'unknown')
