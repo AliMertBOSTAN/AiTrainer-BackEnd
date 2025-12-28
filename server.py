@@ -879,6 +879,7 @@ class WebSocketServer:
                         
                         logger.info(f"Egzersiz analizi: {exercise_type} - {exercise_id}")
                         
+                        # Burada analyze fonksiyonu görüntünün üzerine çizim yapar (processed_img)
                         processed_img, result = self.analyzer.analyze(img, exercise_type, exercise_id)
                         
                         # İşlenmiş görüntüyü base64'e çevir
@@ -889,7 +890,7 @@ class WebSocketServer:
                         response = {
                             'type': 'result',
                             'data': {
-                                'processed_image': processed_base64,
+                                'processed_image': processed_base64, # İŞTE BURASI GÖRÜNTÜYÜ GÖNDERİYOR
                                 'count': result['count'],
                                 'correct_form': result['correct_form'],
                                 'feedback': result['feedback'],
