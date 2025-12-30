@@ -93,8 +93,10 @@ def create_token(user_id: str) -> str:
     return jwt.encode(payload, JWT_SECRET, algorithm="HS256")
 
 def send_verification_email(to_email: str, code: str, name: str) -> None:
+    # Geliştirme aşamasında kodu her zaman konsola yazalım, böylece mail gitmese bile test edilebilir.
+    logger.info(f"🔑 [DEBUG] DOĞRULAMA KODU ({to_email}): {code}")
+
     if not MAILER_EMAIL or not MAILER_APP_PASSWORD:
-        # Geliştirme ortamında mail atılamazsa loga yazalım
         logger.warning(f"MAILER ayarları eksik. Kod: {code}")
         return
 
@@ -109,28 +111,55 @@ Kod 15 dakika geçerli."""
     msg["From"] = MAILER_EMAIL
     msg["To"] = to_email
 
+    # Bağlantı denemesi
     try:
-        # [Errno 101] Network is unreachable hatası genellikle sunucunun IPv6 yapılandırmasından kaynaklanır.
-        # Bu sorunu aşmak için DNS çözümlemesini zorla IPv4 olarak yapıyoruz.
+        # Önce standart 587 portunu deneyelim (IPv4 zorlamalı)
         gmail_host = "smtp.gmail.com"
-        gmail_port = 587
         
-        # IPv4 adresini al (AF_INET)
-        addr_info = socket.getaddrinfo(gmail_host, gmail_port, socket.AF_INET, socket.SOCK_STREAM)
-        gmail_ip = addr_info[0][4][0]
-        
-        # IP adresi ile bağlandığımız için hostname doğrulamasını esnetiyoruz
-        context = ssl.create_default_context()
-        context.check_hostname = False
-        
-        with smtplib.SMTP(gmail_ip, gmail_port) as smtp:
-            smtp.starttls(context=context)
-            smtp.login(MAILER_EMAIL, MAILER_APP_PASSWORD)
-            smtp.send_message(msg)
+        try:
+            # Port 587 Denemesi
+            context = ssl.create_default_context()
+            context.check_hostname = False
             
+            # IPv4 çözümleme
+            addr_info = socket.getaddrinfo(gmail_host, 587, socket.AF_INET, socket.SOCK_STREAM)
+            gmail_ip = addr_info[0][4][0]
+            
+            with smtplib.SMTP(gmail_ip, 587, timeout=10) as smtp:
+                smtp.starttls(context=context)
+                smtp.login(MAILER_EMAIL, MAILER_APP_PASSWORD)
+                smtp.send_message(msg)
+                logger.info(f"Mail başarıyla gönderildi (Port 587): {to_email}")
+                return
+                
+        except Exception as e_587:
+            logger.warning(f"Port 587 üzerinden gönderim başarısız ({e_587}). Port 465 deneniyor...")
+
+        # Eğer 587 başarısız olursa 465 (SSL) deneyelim
+        try:
+            context = ssl.create_default_context()
+            context.check_hostname = False
+            
+            # IPv4 çözümleme
+            addr_info = socket.getaddrinfo(gmail_host, 465, socket.AF_INET, socket.SOCK_STREAM)
+            gmail_ip = addr_info[0][4][0]
+            
+            with smtplib.SMTP_SSL(gmail_ip, 465, context=context, timeout=10) as smtp:
+                smtp.login(MAILER_EMAIL, MAILER_APP_PASSWORD)
+                smtp.send_message(msg)
+                logger.info(f"Mail başarıyla gönderildi (Port 465): {to_email}")
+                return
+                
+        except Exception as e_465:
+            logger.error(f"Port 465 üzerinden de gönderim başarısız: {e_465}")
+            raise e_465
+
     except Exception as e:
-        logger.error(f"Mail gönderimi sırasında hata oluştu: {e}")
-        raise e
+        logger.error(f"❌ Mail gönderilemedi: {e}")
+        logger.error("⚠️ DigitalOcean kullanıyorsanız, SMTP portları (25, 465, 587) hesabınızda engelli olabilir.")
+        logger.error("💡 ÇÖZÜM: Konsoldaki '[DEBUG] DOĞRULAMA KODU' satırındaki kodu kullanarak testinize devam edebilirsiniz.")
+        # Hata fırlatmıyoruz, böylece API 500 hatası vermez ve kullanıcı konsoldaki kodla devam edebilir.
+        # raise e 
 
 def get_users_collection():
     if users_collection is None:
