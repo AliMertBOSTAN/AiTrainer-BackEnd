@@ -9,6 +9,7 @@ import platform
 import random
 import smtplib
 import socket
+import ssl
 import sys
 from datetime import datetime, timedelta
 from email.mime.text import MIMEText
@@ -108,10 +109,28 @@ Kod 15 dakika geçerli."""
     msg["From"] = MAILER_EMAIL
     msg["To"] = to_email
 
-    with smtplib.SMTP("smtp.gmail.com", 587) as smtp:
-        smtp.starttls()
-        smtp.login(MAILER_EMAIL, MAILER_APP_PASSWORD)
-        smtp.send_message(msg)
+    try:
+        # [Errno 101] Network is unreachable hatası genellikle sunucunun IPv6 yapılandırmasından kaynaklanır.
+        # Bu sorunu aşmak için DNS çözümlemesini zorla IPv4 olarak yapıyoruz.
+        gmail_host = "smtp.gmail.com"
+        gmail_port = 587
+        
+        # IPv4 adresini al (AF_INET)
+        addr_info = socket.getaddrinfo(gmail_host, gmail_port, socket.AF_INET, socket.SOCK_STREAM)
+        gmail_ip = addr_info[0][4][0]
+        
+        # IP adresi ile bağlandığımız için hostname doğrulamasını esnetiyoruz
+        context = ssl.create_default_context()
+        context.check_hostname = False
+        
+        with smtplib.SMTP(gmail_ip, gmail_port) as smtp:
+            smtp.starttls(context=context)
+            smtp.login(MAILER_EMAIL, MAILER_APP_PASSWORD)
+            smtp.send_message(msg)
+            
+    except Exception as e:
+        logger.error(f"Mail gönderimi sırasında hata oluştu: {e}")
+        raise e
 
 def get_users_collection():
     if users_collection is None:
