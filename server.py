@@ -11,6 +11,7 @@ import smtplib
 import socket
 import ssl
 import sys
+import traceback  # Hata takibi için eklendi
 from datetime import datetime, timedelta
 from email.mime.text import MIMEText
 
@@ -275,31 +276,72 @@ class ExerciseAnalyzer:
             'sit_up': self.analyze_situp,
             'sit-up': self.analyze_situp
         }
+        # Her hareket için önemli olan eklem noktaları (MediaPipe ID'leri)
+        self.relevant_landmarks_map = {
+            'pushup': [11, 12, 13, 14, 15, 16, 23, 24], # Omuzlar, Dirsekler, Bilekler, Kalçalar
+            'squat': [11, 12, 23, 24, 25, 26, 27, 28], # Omuzlar, Kalçalar, Dizler, Ayak Bilekleri
+            'biceps_curl': [11, 12, 13, 14, 15, 16], # Omuzlar, Dirsekler, Bilekler
+            'shoulder_press': [11, 12, 13, 14, 15, 16, 23, 24],
+            'plank': [11, 23, 25, 27, 7], # Omuz, Kalça, Diz, Ayak Bileği, Kulak
+            'lunges': [23, 24, 25, 26, 27, 28, 11, 12],
+            'jumping_jack': [11, 12, 13, 14, 23, 24, 27, 28],
+            'situp': [11, 23, 25, 27, 7],
+        }
         self.exercise_state = {}
         
     def analyze(self, img, exercise_type, exercise_id):
-        output_img = img.copy()
-        output_img = self.detector.find_pose(output_img)
-        lm_list = self.detector.find_position(output_img)
-        
-        exercise_type = exercise_type.lower().replace('-', '_').replace(' ', '_')
-        
-        if exercise_type in self.exercises and lm_list:
-            if exercise_id not in self.exercise_state:
-                self.exercise_state[exercise_id] = {
-                    'count': 0,
-                    'direction': 0,
-                    'form_errors': []
-                }
+        try:
+            output_img = img.copy()
+            output_img = self.detector.find_pose(output_img)
+            lm_list = self.detector.find_position(output_img)
             
-            result = self.exercises[exercise_type](output_img, lm_list, exercise_id)
+            exercise_type = exercise_type.lower().replace('-', '_').replace(' ', '_')
+            
+            # Sonuç objesini hazırla
+            result = {
+                'count': 0,
+                'correct_form': False,
+                'feedback': '',
+                'landmarks': []
+            }
+
+            # İlgili hareketin önemli noktalarını al
+            relevant_ids = self.relevant_landmarks_map.get(exercise_type, [])
+
+            if exercise_type in self.exercises and lm_list:
+                if exercise_id not in self.exercise_state:
+                    self.exercise_state[exercise_id] = {
+                        'count': 0,
+                        'direction': 0,
+                        'form_errors': []
+                    }
+                
+                # Egzersiz analizini çalıştır
+                analysis_result = self.exercises[exercise_type](output_img, lm_list, exercise_id)
+                result.update(analysis_result)
+                
+                # Landmarkları (noktaları) sonuca ekle
+                # lm_list formatı: [id, cx, cy, visibility]
+                result['landmarks'] = [
+                    {
+                        'id': lm[0], 
+                        'x': lm[1], 
+                        'y': lm[2], 
+                        'visibility': lm[3],
+                        'is_relevant': lm[0] in relevant_ids # Bu nokta bu hareket için önemli mi?
+                    } 
+                    for lm in lm_list
+                ]
+                
+                return output_img, result
+            
+            result['feedback'] = f'Egzersiz tipi tanınamadı ({exercise_type}) veya vücut tespit edilemedi'
             return output_img, result
-        
-        return output_img, {
-            'count': 0,
-            'correct_form': False,
-            'feedback': f'Egzersiz tipi tanınamadı ({exercise_type}) veya vücut tespit edilemedi'
-        }
+            
+        except Exception as e:
+            logger.error(f"Analiz sırasında hata: {e}")
+            traceback.print_exc()
+            return img, {'count': 0, 'correct_form': False, 'feedback': 'Analiz hatası', 'landmarks': []}
     
     # --- Egzersiz Analiz Fonksiyonları (Kısaltıldı, mantık aynı) ---
     def analyze_pushup(self, img, lm_list, exercise_id):
@@ -657,8 +699,8 @@ async def websocket_endpoint(websocket: WebSocket):
         await websocket.send_text(json.dumps(welcome))
         
         while True:
-            data_str = await websocket.receive_text()
             try:
+                data_str = await websocket.receive_text()
                 data = json.loads(data_str)
                 
                 if data.get('type') == 'exercise':
@@ -667,7 +709,9 @@ async def websocket_endpoint(websocket: WebSocket):
                     nparr = np.frombuffer(image_data, np.uint8)
                     img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
                     
-                    if img is None: continue
+                    if img is None:
+                        logger.warning("Görüntü decode edilemedi (img is None).")
+                        continue
                     
                     img = cv2.resize(img, (640, 480))
                     exercise_type = data.get('exercise_type', 'unknown')
@@ -687,21 +731,25 @@ async def websocket_endpoint(websocket: WebSocket):
                             'count': result['count'],
                             'correct_form': result['correct_form'],
                             'feedback': result['feedback'],
+                            'landmarks': result.get('landmarks', []), # Landmark verisi eklendi
                             'exercise_id': exercise_id
                         },
                         'timestamp': datetime.now().timestamp()
                     }
                     await websocket.send_text(json.dumps(response))
-                    
+            
+            except WebSocketDisconnect:
+                logger.info(f"WebSocket bağlantısı kesildi (Client): {client_ip}")
+                break
             except json.JSONDecodeError:
-                logger.error("Geçersiz JSON")
+                logger.error("Geçersiz JSON verisi.")
             except Exception as e:
-                logger.error(f"İşleme hatası: {e}")
+                logger.error(f"WebSocket döngüsü içinde hata: {e}")
+                traceback.print_exc() # Hatayı konsola detaylı yazdır
                 
-    except WebSocketDisconnect:
-        logger.info(f"WebSocket bağlantısı kesildi: {client_ip}")
     except Exception as e:
-        logger.error(f"WebSocket hatası: {e}")
+        logger.error(f"WebSocket ana hatası: {e}")
+        traceback.print_exc()
 
 def main():
     port = 8000
